@@ -71,43 +71,69 @@ static void *original_syscall182 = NULL;
 static void *original_syscall183 = NULL;
 
 // kernel buffer prototype to hold userspace data
-static char * kernBuff;
+static void * kernBuff;
+
+// flag telling whether kmalloc succeded
+static int kmallocWorked = 0;
 
 // Function prototypes
-static unsigned long ourmb_open(const char * mailboxID, int kernBuffCapacity, pid_t procID, int flag);
+static unsigned long ourmb_open(const char *, pid_t, int, int); //typeof(pid_t) == int
 
-static unsigned long ourmb_clos(const char * mailboxID, pid_t procID);
+static unsigned long ourmb_clos(const char *, pid_t);
 
-static unsigned long ourmb_send(const char * mailboxID, pid_t procID, char * kernBuff, char * sendBuff, int sizeOfSendBuff);
+static unsigned long ourmb_send(const char *, pid_t, char *, char *, int);
 
-static unsigned long ourmb_recv(const char * mailboxID, pid_t procID, char * recvBuff, char * kernBuff);
+static unsigned long ourmb_recv(const char *, pid_t, char *, char *);
 
 
 /******************   Custom system call implementations   ******************/
 
-static unsigned long ourmb_open(const char * mailboxID, int kernBuffCapacity, pid_t procID, int flag)
+static unsigned long ourmb_open(const char * mailboxID, pid_t procID, int kernBuffCapacity, int flag)
 {
-    
+    //Add to log for debugging, to be removed later
 	printk(KERN_INFO "Userspace call to ourq_open() succeded!\n");
-	printk(KERN_INFO "Params passed are:\nmailboxID: %p\nkernBuffCapacity: %i\n procID: %i\n flag: %i\n", mailboxID, kernBuffCapacity, procID, flag);
-	return 0;
+	printk(KERN_INFO "ourmb_open params received:\n");
+    printk(KERN_INFO "mailboxID(ptr): \t%p\n",        &mailboxID);
+    printk(KERN_INFO "mailboxID(str): \t%s\n",        mailboxID);
+    printk(KERN_INFO "procID(int): \t%i\n",           procID);
+	printk(KERN_INFO "kernBuffCapacity(int): \t%i\n", kernBuffCapacity);
+    printk(KERN_INFO "flag(int): \t%i\n",             flag);
+    return 0;
 }
 
 static unsigned long ourmb_clos(const char * mailboxID, pid_t procID)
 {
+    //Add to log for debugging, to be removed later
 	printk(KERN_INFO "Userspace call to ourq_clos() succeded!\n");
-	return 0;
+	printk(KERN_INFO "ourmb_open params received:\n");
+    printk(KERN_INFO "mailboxID(ptr): \t%p\n", &mailboxID);
+    printk(KERN_INFO "mailboxID(str): \t%s\n", mailboxID);
+    printk(KERN_INFO "procID(int): \t%i\n",    procID);
+    return 0;
 }
 
 static unsigned long ourmb_send(const char * mailboxID, pid_t procID, char * kernBuff, char * sendBuff, int sizeOfSendBuff)
-{
+{   
+    //Add to log for debugging, to be removed later
 	printk(KERN_INFO "Userspace call to ourq_send() succeded!\n");
+    printk(KERN_INFO "ourmb_send params received:\n");
+    printk(KERN_INFO "mailboxID(ptr): \t%p\n", &mailboxID);
+    printk(KERN_INFO "mailboxID(str): \t%s\n", mailboxID);
+    printk(KERN_INFO "procID(int): \t%i\n",    procID);
+	printk(KERN_INFO "sendBuff(ptr): \t%p\n",  sendBuff);
+    printk(KERN_INFO "sizeOfSendBuff: \t%i\n", sizeOfSendBuff);
 	return 0;
 }
 
 static unsigned long ourmb_recv(const char * mailboxID, pid_t procID, char * recvBuff, char * kernBuff)
 {
 	printk(KERN_INFO "Userspace call to ourq_recv() succeded!\n");
+    printk(KERN_INFO "ourmb_recv params received:\n");
+    printk(KERN_INFO "mailboxID(ptr): \t%p\n", &mailboxID);
+    printk(KERN_INFO "mailboxID(str): \t%s\n", mailboxID);
+    printk(KERN_INFO "procID(int): \t%i\n",    procID);
+	printk(KERN_INFO "recvBuff(ptr): \t%p\n",  recvBuff);
+    printk(KERN_INFO "kernBuff(ptr): \t%p\n",  kernBuff);
 	return 0;
 }
 /************************************************************************/
@@ -180,7 +206,11 @@ static int init_syscalls(void)
         hijack_syscall(__NR_ourmb_send, (ulong)ourmb_send, original_syscall182);
         hijack_syscall(__NR_ourmb_recv, (ulong)ourmb_recv, original_syscall183);
         printk(KERN_INFO "Module loaded: Syscalls successfully hijacked\n");
+    //kmalloc to be moved to ourmb_open() after initial testing
         kernBuff = kmalloc (__KERNBUFF_MAX_BYTES, GFP_ATOMIC);
+        printk(KERN_INFO "Within init_syscalls, kernBuff(ptr): \t%p\n",  &kernBuff);
+        printk(KERN_INFO "kmalloc() allocated: %zu bytes of memory\n", ksize(kernBuff));
+        kmallocWorked = kernBuff != NULL;
         return 0;
 }
 
@@ -196,7 +226,10 @@ static void cleanup_syscalls(void)
 	//permission from rw -> ro 
         page_read_only((ulong)syscall_table);
         printk(KERN_INFO "Module unloaded: Syscalls restored successfully\n");
-        kfree(kernBuff);
+    //kfree() to be moved to ourmb_clos() after initial testing    
+        if(kmallocWorked){
+            kfree(kernBuff);
+        }
 }
 
 module_init(init_syscalls);
