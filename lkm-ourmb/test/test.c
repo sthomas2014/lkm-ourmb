@@ -24,17 +24,23 @@ int main(int argc, char* argv[])
     char line[100];
     const char * mailboxID = "MAILBOX_1";
     int kernBuffCapacity = __KERNBUFF_MAX_BYTES / sizeof(line);
-    char * sendBuff = malloc(kernBuffCapacity*sizeof(line));
-    char * recvBuff = malloc(kernBuffCapacity*sizeof(line));    
-    char * kernBuff = malloc(__KERNBUFF_MAX_BYTES); //4096 bytes == 1 pagesize for x86
+    void * sendBuff = malloc(kernBuffCapacity*sizeof(line));
+    void * recvBuff = malloc(kernBuffCapacity*sizeof(line));    
+    void * kernBuff = malloc(__KERNBUFF_MAX_BYTES); //4096 bytes == 1 pagesize for x86
     int sizeOfSendBuff = sizeof(sendBuff);
     pid_t procID = getpid();
     int flag = 2;
     
-    printf("mailboxID is: %s\n",mailboxID);
-    printf("kernBuffCapacity is: %d\n",kernBuffCapacity);
-    printf("sizeOfSendBuff is: %d\n", sizeOfSendBuff);
-
+    printf("mailboxID(ptr): %p\n",&mailboxID);
+    printf("mailboxID(str): %s\n",mailboxID);
+	printf("kernBuffCapacity(int): %i\n",kernBuffCapacity);
+    printf("procID(pid_t == int): %i\n",procID);
+    printf("flag(int): %i\n",flag);
+    printf("recvBuff(ptr): %p\n",recvBuff);
+    printf("sendBuff(ptr): %p\n",sendBuff);
+    printf("sizeOFSendBuff(int): %i\n",sizeOfSendBuff);
+    
+    
 	ourmb_open(mailboxID, procID, kernBuffCapacity, flag);
     
 	ourmb_clos(mailboxID, procID);
