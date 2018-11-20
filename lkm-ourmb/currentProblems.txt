@@ -1,0 +1,14 @@
+
+
+Working on getting KFIFO code implemented.
+This is a FIFO queue system built into the kernel.
+API showing syntax, etc: https://www.kernel.org/doc/htmldocs/kernel-api/kfifo.html#id-1.8.2
+
+Compiling errors are coming from kfifo initialization. Believe we need to do a dynamic initialization vs static
+
+main 2 functions we'll need for ourmb_send(), ourmb_recv():
+kfifo_from_user — puts some data from user space into the fifo
+kfifo_to_user — copies data from the fifo into user space
+
+Similar to copy_from_user(), copy_to_user that we were using.
+
