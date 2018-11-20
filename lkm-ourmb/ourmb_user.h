@@ -3,7 +3,9 @@
 #include <errno.h>
 #include <unistd.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <signal.h>
+#include <time.h>
 
 // Following convention
 #ifndef _OURMB_USER_H
@@ -45,49 +47,71 @@
 #endif
 
 #ifndef __MAX_MAILBOXID_LENGTH
-#define __MAX_MAILBOXID_LENGTH 20
+#define __MAX_MAILBOXID_LENGTH 15
 #endif
 
 #ifndef __MAX_READERS_WRITER
-#define __MAX_READERS_WRITER 10 //max: 9 readers, 1 writer
+#define __MAX_READERS_WRITER 5 //max: 4 readers, 1 writer
 #endif
 
+#ifndef __MAX_MSG_SIZE
+#define __MAX_MSG_SIZE 1024
+#endif
 /* Userspace function prototypes w/ wrapper */
 
 
-// ourmb_open() will be called by both sender (reader) and receiver (writer).
-// The sender process MUST call ourmb_open() FIRST (BEFORE receiver).
-// First successful call wll allocate memory for mailbox in kernel space,
-//      enter process into access list. 
-static int ourmb_open(const char * mailboxID, pid_t procID, int kernBuffCapacity,  int flag)
+/* ourmb_open() will be called by both sender (reader) and receiver (writer).
+ * The sender process MUST call ourmb_open() FIRST (BEFORE receiver).
+ * First successful call wll allocate memory for mailbox in kernel space,
+ *      enter process into access list.
+ * Input args:
+ * const char * mailboxID - Unique mailbox identifier
+ * pid_t procID - Process ID of the calling process
+ * int lineLen - Number of characters per line that will be read
+ * int flag - Identifies what the calling proccess is attempting to do
+ */
+static int ourmb_open(const char * mailboxID, pid_t procID, int lineLen,  int flag)
 {
-	return syscall(__NR_ourmb_open, mailboxID, procID, kernBuffCapacity, flag);
+	return syscall(__NR_ourmb_open, mailboxID, procID, lineLen, flag);
 }
 
-// ourmb_clos() will be called by both sender (reader) and receiver (writer).
-// The receiver process MUST call ourmb_clos() LAST (AFTER sender).
-// Last successful call will deallocate memory for mailbox in kernel space,
-//      remove (last & only) process from access list.
+/* ourmb_clos() will be called by both sender (reader) and receiver (writer).
+ * The receiver process MUST call ourmb_clos() LAST (AFTER sender).
+ * Last successful call will deallocate memory for mailbox in kernel space,
+ *      remove (last & only) process from access list.
+ * Input args:
+ * const char * mailboxID - Unique mailbox identifier
+ * pid_t procID - Process ID of the calling process
+ */
 static int ourmb_clos(const char * mailboxID, pid_t procID)
 {
-	return syscall(__NR_ourmb_recv, mailboxID, procID);
+	return syscall(__NR_ourmb_clos, mailboxID, procID);
 }
 
-// utilizes copy_from_user()
-// ourmb_send() will be callled from sending (reader) process only
-// Sender sends a struct containing a pointer to the "chunked" data
-//      and the number of entries and number of bytes
-static int ourmb_send(const char * mailboxID, pid_t procID, char * kernBuff, char * sendBuff, int sizeOfSendBuff) 
+/* utilizes copy_from_user()
+ * ourmb_send() will be callled from sending (reader) process only
+ * Input args:
+ * const char * mailboxID - Unique mailbox identifier
+ * pid_t procID - Process ID of the calling process
+ * char * sendBuff - Pointer the the data to be sent from userspace to kernel space
+ * size_t sizeOfSendBuff - Number of bytes allocated for sendBuff (capacity)
+ */
+ static int ourmb_send(const char * mailboxID, pid_t procID, char * sendBuff, size_t sizeOfSendBuff) 
 {
-	return syscall(__NR_ourmb_clos, mailboxID, procID, kernBuff, sendBuff, sizeOfSendBuff);
+	return syscall(__NR_ourmb_send, mailboxID, procID, sendBuff, sizeOfSendBuff);
 }
 
-// utilizes copy_to_user()
-// ourmb_recv will be called from recieving (writing) process only
-// Receiver gets pushed data from kernel
-static int ourmb_recv(const char * mailboxID, pid_t procID, char * recvBuff, char * kernBuff)
+/* utilizes copy_to_user()
+ * ourmb_recv will be called from recieving (writing) process only 
+ * Receiver gets pushed data from kernel
+ * Input args:
+ * const char * mailboxID - Unique mailbox identifier
+ * pid_t procID - Process ID of the calling process
+ * char * recvBuff - Pointer to the destination of the data to be sent from kernel space
+ */ 
+static int ourmb_recv(const char * mailboxID, pid_t procID, char * recvBuff)
 {
-	return syscall(__NR_ourmb_send, mailboxID, procID, recvBuff, kernBuff);
+	return syscall(__NR_ourmb_recv, mailboxID, procID, recvBuff);
 }
 
 
