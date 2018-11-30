@@ -11,7 +11,7 @@
 TARGET	= test
 SRC	= test.c
 OBJ	= $(SRC:.c=.o)
-CC	= gcc
+CC	= gcc -std=c11 -pedantic
 CFLAGS	+= -W -Wall
 RM	= rm -vf
 
