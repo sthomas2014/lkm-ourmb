@@ -47,19 +47,21 @@
 #define SYS_CALL_TABLE "sys_call_table"
 #endif
 
-// Flags for ourmb_open
-#ifndef __FLAG_OPEN
-#define __FLAG_OPEN 1
+
+#ifndef __FLAG_OPEN_SEND
+#define __FLAG_OPEN_SEND 1
 #endif
 
-// readers read from user; SEND to kernel
+#ifndef __FLAG_OPEN_RECV
+#define __FLAG_OPEN_RECV 2
+#endif
+
 #ifndef __FLAG_SEND
-#define __FLAG_SEND 2
+#define __FLAG_SEND 4
 #endif
 
-// writers RECIEVE from kernel; write to user
 #ifndef __FLAG_RECV
-#define __FLAG_RECV 4
+#define __FLAG_RECV 8
 #endif
 
 // Maximums
@@ -74,7 +76,6 @@
 #endif
 
 // 1 mailbox will support upto
-// 5 readers, 1 writer
 #ifndef __MAX_READERS_WRITER
 #define __MAX_READERS_WRITER 10
 #endif
@@ -87,14 +88,12 @@
 #define __KERN_PAGE_SIZE 4096
 #endif
 
-#ifndef __MAX_ELEMENT_SIZE
-#define __MAX_ELEMENT_SIZE 32
-#endif
-
+/*
 //For kfifo dynamic allocation
 #ifndef DYNAMIC
 #define DYNAMIC
 #endif
+*/
 
 // Loadable kernel module info
 MODULE_LICENSE("GPL");
@@ -104,16 +103,6 @@ MODULE_VERSION("0.1");
 
 
 /******************************** PROTOTYPES *********************************/
-//static spinlock_t ourmbOpenLock = __SPIN_LOCK_UNLOCKED;
-//static spinlock_t ourmbClosLock = __SPIN_LOCK_UNLOCKED;
-//static spinlock_t ourmbSendLock = __SPIN_LOCK_UNLOCKED;
-//static spinlock_t ourmbRecvLock = __SPIN_LOCK_UNLOCKED;
-DEFINE_SPINLOCK(ourmbOpenLock);
-DEFINE_SPINLOCK(ourmbClosLock);
-DEFINE_SPINLOCK(ourmbSendLock);
-DEFINE_SPINLOCK(ourmbRecvLock);
-
-
 // Address of syscall table
 static ulong * syscall_table = NULL;
 
@@ -123,10 +112,14 @@ static void * original_syscall181 = NULL;
 static void * original_syscall182 = NULL;
 static void * original_syscall183 = NULL;
 
-// dummy kfifo struct
-static struct kfifo dummy;
 
-// turning mbAccesslist into linked list
+static spinlock_t ourmbOpenLock;
+static spinlock_t ourmbClosLock;
+static spinlock_t ourmbSendLock;
+static spinlock_t ourmbRecvLock;
+
+static struct kfifo fifoQueues[__MAX_NUM_MAILBOXES];
+
 // kMbAccessList
 typedef struct 
 {
@@ -142,38 +135,65 @@ typedef struct
     int kNumReaders; // readers assigned to particular mailbox
     int kNumWriters; // writers assigned to particular mailbox
     kMbAccessList kAccessList[__MAX_READERS_WRITER];
-    struct kfifo kFifo;
+    char kFifoBuff[32];
  } kMailingList; 
-
  
 // mailing list prototype: list of mailboxID's and process access info
 static kMailingList mailingList[__MAX_NUM_MAILBOXES]; 
+
+/*//make message struct to replace char *, call KFIFO_INIT() within initialization function
+ int i = 0;
+ for(i=0;i<__MAX_NUM_MAILBOXES;i++){
+    DECLARE_KFIFO(mailingList[i].kFifoBuff,char *,)
+ }
+*/
 
 // boolean array of open mailbox slots. TRUE == 1 -> open
 static int mbSlotsFree[__MAX_NUM_MAILBOXES];
 
 // helper function prototypes
-static int findFreeMbSlot(int claim);
-static void clearMbSlot(int slot);
-static int findMailboxID(const char *);
+static void dumpData(void);
+static void clearMbSlot(int slot); // Called when a mailbox is to be closed
 static void initializeAllFields(void);
-static void clearMailingListFields(int mbIterator);
+static void clearMailingListFields(int mbIterator); //
 static void initializeMbAccessList(int mbIterator);
+static void invalidateProcID(int mbIterator, pid_t procID);
+static void garbageMailboxIdCheck(void);
+static int findFreeMbSlot(int claim);
+static int findMailboxID(const char *);
 static int procIDhasValidAccess(int mbIterator, pid_t procID);
 static int findNumValidAccess(int mbIterator);
 static int findLowestInvalidAccessIndex(int mbIterator);
-static void invalidateProcID(int mbIterator, pid_t procID);
 static int findSendRecvType(int mbIterator, pid_t procID);
 static int findAccessIndexOfProcID(int mbIterator, pid_t procID);
 
 // System call function prototypes
 static int ourmb_open(const char *, pid_t, int, int); //typeof(pid_t) == int
 static int ourmb_clos(const char *, pid_t);
-static int ourmb_send(const char *, pid_t, char *, int);
-static int ourmb_recv(const char *, pid_t, char *);
+static int ourmb_send(const char *, pid_t, char *, int, int *);
+static int ourmb_recv(const char *, pid_t, char *, int *);
 
 
 /****************** Helper function implementations ******************/
+static void dumpData(void)
+{
+    int i = 0;
+    int j = 0;
+    printk(KERN_INFO "********************     Begin Data Dump     ********************");
+    for(i=0;i<__MAX_NUM_MAILBOXES;i++)
+    {
+        printk(KERN_INFO "mbSlotsFree[%i]: %i",i,mbSlotsFree[i]);
+    }
+    for(i=0;i<__MAX_NUM_MAILBOXES;i++)
+    {
+        printk(KERN_INFO "mailingList[%i]:\tkMailboxID: %s\tkNumReaders: %i\tkNumWriters: %i\tkFifoBuff: %p\n",i,mailingList[i].kMailboxID, mailingList[i].kNumReaders, mailingList[i].kNumWriters, mailingList[i].kFifoBuff);
+        for(j=0;j<__MAX_READERS_WRITER;j++)
+        {
+            printk(KERN_INFO "kAccessList[%i]:\tkProcID: %i\tkFlagID: %i\n",j,mailingList[i].kAccessList[j].kProcID,mailingList[i].kAccessList[j].kFlagID);
+        }
+    }
+    printk(KERN_INFO "********************     End Data Dump     ********************");
+}
 
 // returns the lowest free mailbox index (and sets to unfree if claim == 1)
 static int findFreeMbSlot(int claim)
@@ -194,6 +214,20 @@ static int findFreeMbSlot(int claim)
     return openSlot;
 }
 
+static void garbageMailboxIdCheck(void)
+{
+ int i = 0;
+ 
+ for(i = 0; i < __MAX_NUM_MAILBOXES; i++)
+ {
+    if(findNumValidAccess(i) == 0)
+    {
+        clearMailingListFields(i);
+        mbSlotsFree[i] = 1;
+    }
+ }
+}
+
 static void clearMbSlot(int slot)
 {
     mbSlotsFree[slot] = 1; 
@@ -204,19 +238,19 @@ static void clearMbSlot(int slot)
 // return index of mailboxSlot if found, returns -1 otw
 static int findMailboxID(const char * mailboxID)
 {
-    int found = 0;
+    int found = -1;
     int i = 0;
-    for (;i < __MAX_NUM_MAILBOXES && !(found); i++)
+    for (i = 0;i < __MAX_NUM_MAILBOXES && found < 0; i++)
     {
-        if(strlen(mailboxID) > 0 && strlen(mailboxID) == strlen(mailingList[i].kMailboxID))
+        if(strlen(mailboxID) == strlen(mailingList[i].kMailboxID))
         {
             if(strncmp(mailboxID, mailingList[i].kMailboxID, strlen(mailboxID)) == 0)
             {
-                found = 1;
+                found = i;
             }                
         }
     }
-    return (found) ? i : -1;
+    return found;
 }
 
 // Returns boolean true if given procID is found on kAccessList for a particular mailbox
@@ -236,7 +270,7 @@ static int findNumValidAccess(int mbIterator)
 {
     int numValid = 0;
     int i = 0;
-    for (; i < __MAX_READERS_WRITER; i++)
+    for (i = 0; i < __MAX_READERS_WRITER; i++)
     {
         numValid += (mailingList[mbIterator].kAccessList[i].kProcID != -1);        
     }
@@ -248,7 +282,7 @@ static int findLowestInvalidAccessIndex(int mbIterator)
 {
     int lowestIndex = -1;
     int i = 0;
-    for (; i < __MAX_READERS_WRITER && lowestIndex < -1; i++)
+    for (i = 0; i < __MAX_READERS_WRITER && lowestIndex < 0; i++)
     {
         if(mailingList[mbIterator].kAccessList[i].kProcID == -1)
         {
@@ -262,20 +296,20 @@ static int findLowestInvalidAccessIndex(int mbIterator)
 // WIPES EVERYTHING
 static void initializeAllFields(void)
 {
+    int i = 0;
     int j = 0;
-    for(; j < __MAX_NUM_MAILBOXES; j++)
+    for(i = 0; i < __MAX_NUM_MAILBOXES; i++)
     {     
-        int i = 0;
-        for(; i < __MAX_READERS_WRITER; i++)
+        for(j = 0; j < __MAX_READERS_WRITER; j++)
         {
-            mailingList[j].kAccessList[i].kProcID = -1;
-            mailingList[j].kAccessList[i].kFlagID = -1;    
+            mailingList[i].kAccessList[j].kProcID = -1;
+            mailingList[i].kAccessList[j].kFlagID = -1;    
         }
-        strncpy(mailingList[j].kMailboxID,"\0", strlen("\0"));
-        mailingList[j].kNumReaders = -1;
-        mailingList[j].kNumWriters = -1;
-        mailingList[j].kFifo = dummy;
-        clearMbSlot(j);
+        mailingList[i].kMailboxID[0] = '\0';
+        mailingList[i].kNumReaders = -1;
+        mailingList[i].kNumWriters = -1;
+        //kfifo_reset(mailingList[j].kFifo);
+        clearMbSlot(i);
     }
 }
 
@@ -283,24 +317,24 @@ static void initializeAllFields(void)
 static void clearMailingListFields(int mbIterator)
 {
     int i = 0;
-    for(; i < __MAX_READERS_WRITER; i++)
+    for(i = 0; i < __MAX_READERS_WRITER; i++)
     {
         mailingList[mbIterator].kAccessList[i].kProcID = -1;
         mailingList[mbIterator].kAccessList[i].kFlagID = -1;    
     }
-    strncpy(mailingList[i].kMailboxID,"\0", strlen("\0"));
+    mailingList[mbIterator].kMailboxID[0] = '\0';
+    printk (KERN_INFO "After clearing mailboxID: %s",mailingList[mbIterator].kMailboxID);
     mailingList[mbIterator].kNumReaders = -1;
     mailingList[mbIterator].kNumWriters = -1;
-    mailingList[mbIterator].kFifo = dummy;
-    mbSlotsFree[mbIterator] = 1;
-    clearMbSlot(mbIterator);
+    //kfifo_reset(mailingList[mbIterator].kFifo);
+    //clearMbSlot(mbIterator);
 }
 
 // Called when mailbox is to be opened
 static void initializeMbAccessList(int mbIterator)
 {
    int i = 0;
-    for(; i < __MAX_READERS_WRITER; i++)
+    for(i = 0; i < __MAX_READERS_WRITER; i++)
     {
         mailingList[mbIterator].kAccessList[i].kProcID = -1;
         mailingList[mbIterator].kAccessList[i].kFlagID = -1;    
@@ -308,38 +342,52 @@ static void initializeMbAccessList(int mbIterator)
 }
 
 // Called when a process wishes to unsubscribe from mailbox
+// decrements r/w count
 static void invalidateProcID(int mbIterator, pid_t procID)
 {
     int index = findAccessIndexOfProcID(mbIterator, procID);
+    
     if (index > -1)
     {
+        
+        if(mailingList[mbIterator].kAccessList[index].kFlagID == __FLAG_RECV)
+        {
+            mailingList[mbIterator].kNumWriters -= 1;        
+        }
+        if(mailingList[mbIterator].kAccessList[index].kFlagID == __FLAG_SEND)
+        {
+            mailingList[mbIterator].kNumReaders -= 1;
+        }
         mailingList[mbIterator].kAccessList[index].kFlagID = -1;
         mailingList[mbIterator].kAccessList[index].kProcID = -1;
     }
 }
 
+/*
 static int findSendRecvType(int mbIterator, pid_t procID)
 {
     int flagType = -1;
     int index = findAccessIndexOfProcID(mbIterator, procID);
     if (index > -1)
     {
-        flagType = mailingList[mbIterator].kAccessList[index].kFlagID = -1;
+        flagType = mailingList[mbIterator].kAccessList[index].kFlagID;
     }
     return flagType;
 }
+*/
 
 static int findAccessIndexOfProcID(int mbIterator, pid_t procID)
 {
     int i = 0;
-    for(; i < __MAX_READERS_WRITER; i++)
+    int found = -1;
+    for(; i < __MAX_READERS_WRITER && found < 0; i++)
     {
         if(mailingList[mbIterator].kAccessList[i].kProcID == procID)
         {
-            return i;
+            found = 1;
         }  
     }
-    return -1;   
+    return found;   
 }
 
 /******************   Custom system call implementations   ******************/
@@ -347,36 +395,63 @@ static int findAccessIndexOfProcID(int mbIterator, pid_t procID)
 static int ourmb_open(const char * mailboxID, pid_t procID, int lineLen, int flagID)
 { 
     spin_lock(&ourmbOpenLock);
-    if(lineLen > __MAX_ELEMENT_SIZE)
+    if(strlen(mailboxID) > __MAX_MAILBOXID_LENGTH)
     {
         spin_unlock(&ourmbOpenLock);
         return -1;
     }
+    
+    garbageMailboxIdCheck();
+    
      // Case when:
-    // 1. Calling process is a sender and wants to open a new mailbox. Indicated by flagID
+    // 1. Calling process is a sender/receiver and wants to open a new mailbox. Indicated by flagID
     // 2. The mailboxID provided is not already on the mailingList[i].mailboxID
-    if(flagID == (__FLAG_OPEN | __FLAG_SEND))
+    if((flagID == __FLAG_OPEN_SEND) || (flagID == __FLAG_OPEN_RECV))
     {   
-        //handles 1st sender
+        printk(KERN_INFO "In ourmb_open: passed flag open check.\n");
+        //handles 1st sender/receiver
         int localMailboxIterator = findMailboxID(mailboxID);
         int openSlot = findFreeMbSlot(1); //(1) selects option to claim slot if open
+        printk(KERN_INFO "In ourmb_open: parameters for (mailboxID DNE exist) and (is free slot)\nlocalMailboxIterator: %i\nopenSlot: %i\nmailboxID: %s\nprocID: %i",localMailboxIterator,openSlot,mailboxID,procID);
         if( localMailboxIterator < 0 && openSlot > -1)
         {
             //Initialize info in mailing list for this mailbox
-            initializeMbAccessList(localMailboxIterator);
+            initializeMbAccessList(openSlot);
+            clearMailingListFields(openSlot);
+            //mailingList[openSlot].kFifoBuff = kmalloc(__KERN_PAGE_SIZE, GFP_KERNEL);
+            if(mailingList[openSlot].kFifoBuff == NULL)
+            {
+                printk(KERN_ERR "In ourmb_open: kmalloc() failed.\n");
+                spin_unlock(&ourmbOpenLock);
+                return -1;
+            }
             
-            DEFINE_KFIFO(mailingList[openSlot].kFifo, char *, __KERN_PAGE_SIZE/lineLen);
+            //DECLARE_KFIFO((*fifoQueues)[openSlot], unsigned char, __KERN_PAGE_SIZE/lineLen);            
+            //kfifo_init(fifoQueues[openSlot],mailingList[openSlot].kFifoBuff,__KERN_PAGE_SIZE);
+            
+            //mailingList[openSlot].kFifo = temp
             // Cannot direclty assign string in c
             strncpy( mailingList[openSlot].kMailboxID, mailboxID, strlen(mailboxID));
-            mailingList[openSlot].kNumReaders = 1;
-            mailingList[openSlot].kNumWriters = 0;
+            if(flagID == (__FLAG_OPEN_SEND))
+            {
+                mailingList[openSlot].kNumReaders = 1;
+                mailingList[openSlot].kNumWriters = 0;
+                mailingList[openSlot].kAccessList[0].kFlagID = __FLAG_SEND;
+            }
+            else if(flagID == (__FLAG_OPEN_RECV))
+            {
+                mailingList[openSlot].kNumReaders = 0;
+                mailingList[openSlot].kNumWriters = 1;
+                mailingList[openSlot].kAccessList[0].kFlagID = __FLAG_RECV;
+            }
             mailingList[openSlot].kAccessList[0].kProcID = procID;
-            mailingList[openSlot].kAccessList[0].kFlagID = flagID;
             
         } else 
         {
+            printk(KERN_ERR "Failed check in ourmb_open(). 1st if check that handles open flag");
             printk(KERN_ERR "Mailbox ID: %s already taken or max number of mailboxes are open!\n",mailboxID);
-            
+            printk(KERN_ERR "dumpData called within ourmb_open");
+            dumpData();
             spin_unlock(&ourmbOpenLock);
             return -1; //Returns -1 on error
         }
@@ -390,16 +465,23 @@ static int ourmb_open(const char * mailboxID, pid_t procID, int lineLen, int fla
         //Handles receiver
         int localMailboxIterator = findMailboxID(mailboxID);
         int lowestkAccessIndex = findLowestInvalidAccessIndex(localMailboxIterator);
-        if( localMailboxIterator > -1 && mailingList[localMailboxIterator].kNumWriters < 1)
+        printk(KERN_INFO "In ourmb_open: parameters for (mailboxID exists) and(no writers yet)\nlocalMailboxIterator: %i\nmailboxID: %s\nprocID: %i\n",localMailboxIterator,mailboxID,procID);
+        if( localMailboxIterator > -1 && mailingList[localMailboxIterator].kNumWriters < 1 && lowestkAccessIndex > -1)
         { 
             //Mailbox is open && writer not subscribed
-            //Subscribe receiver to messagingList
-            mailingList[localMailboxIterator].kNumWriters = 1; //Add receiver to count
+            //Subscribe receiver to accessList
+            mailingList[localMailboxIterator].kNumWriters += 1; //Add receiver to count
             mailingList[localMailboxIterator].kAccessList[lowestkAccessIndex].kProcID = procID;
             mailingList[localMailboxIterator].kAccessList[lowestkAccessIndex].kFlagID = flagID;
+            
         } else
         {
+            printk(KERN_ERR "Failed check in ourmb_open(). 2nd if check that handles recv flag");
+            printk(KERN_ERR "Mailbox ID: %s DNE or max num writers already",mailboxID);
+            printk(KERN_ERR "dumpData called within ourmb_open");
+            dumpData();
             spin_unlock(&ourmbOpenLock);
+            
             return -1; //Returns -1 on error
         }
     }
@@ -411,15 +493,19 @@ static int ourmb_open(const char * mailboxID, pid_t procID, int lineLen, int fla
    { //Handles receiver
         int localMailboxIterator = findMailboxID(mailboxID);
         int lowestkAccessIndex = findLowestInvalidAccessIndex(localMailboxIterator);
-        if( (localMailboxIterator > -1 && mailingList[localMailboxIterator].kNumReaders < __MAX_READERS_WRITER - 1)
+        if( (localMailboxIterator > -1 && mailingList[localMailboxIterator].kNumReaders < __MAX_READERS_WRITER - 1 && lowestkAccessIndex > -1) )
         { 
             //Mailbox is open && num readers < 9
-            //Subscribe receiver to messagingList
+            //Subscribe receiver to accessList
             mailingList[localMailboxIterator].kNumReaders += 1; //Add reader to count
             mailingList[localMailboxIterator].kAccessList[lowestkAccessIndex].kProcID = procID;
             mailingList[localMailboxIterator].kAccessList[lowestkAccessIndex].kFlagID = flagID;
         } else
         {
+            printk(KERN_ERR "Failed check in ourmb_open(). 3rd if check that handles send flag");
+            printk(KERN_ERR "Mailbox ID: %s DNE or max num of readers already",mailboxID);
+            printk(KERN_ERR "dumpData called within ourmb_open");
+            dumpData();
             spin_unlock(&ourmbOpenLock);
             return -1; //Returns -1 on error
         }
@@ -432,65 +518,83 @@ static int ourmb_open(const char * mailboxID, pid_t procID, int lineLen, int fla
 
 static int ourmb_clos(const char * mailboxID, pid_t procID)
 {    
-    spin_lock(&ourmbOpenLock);
+    spin_lock(&ourmbClosLock);
     // Cases:
     // 1. process calls to close and IS last in access list, mailboxID will be removed, 
     //      further calls referencing to this mailbox ID will fail.
     // 2. process calls to close and is NOT last in access list, mailboxID preserved, and
     //      process removed from access list.
+    printk( KERN_INFO "call to ourmb close (pre-closing):\nmailboxID: %s\nprocID: %i\n",mailboxID,procID);
+    dumpData();
+    int ret = 0;
+    
     int localMailboxIterator = findMailboxID(mailboxID);
     if(localMailboxIterator > -1)
     {
+        
         // Case: 1
-        if(procIDhasValidAccess(localMailboxIterator, procID) && findNumValidAccess(localMailboxIterator) == 1)
+        if(procIDhasValidAccess(localMailboxIterator, procID) && findNumValidAccess(localMailboxIterator) > 1)
         { 
-            kfree(mailingList[localMailboxIterator].kFifo);
-            clearMailingListFields(localMailboxIterator);        
+            invalidateProcID(localMailboxIterator, procID); //also decrements r/w count
         }
         // Case: 2
-        else if(procIDhasValidAccess(localMailboxIterator, procID) && findNumValidAccess(localMailboxIterator) > 1)
-        {
-            
-            int flag = findSendRecvType(localMailboxIterator, procID);
-            if (flag == (__FLAG_OPEN | __FLAG_SEND) || flag == __FLAG_SEND)
-            {
-                mailingList[localMailboxIterator].kNumReaders -= 1;
-            }
-            else // __FLAG_RECV
-            {
-                mailingList[localMailboxIterator].kNumWriters -= 1;
-            }
-            invalidateProcID(localMailboxIterator, procID);
-            
+        else if (procIDhasValidAccess(localMailboxIterator, procID) && findNumValidAccess(localMailboxIterator) == 1)
+        {        
+            invalidateProcID(localMailboxIterator, procID); //also decrements r/w count
+            //kfifo_free(&fifoQueues[localMailboxIterator]);
+            clearMailingListFields(localMailboxIterator);           
         }
-        spin_unlock(&ourmbClosLock);
-        return 0; //Success
-    }
+        
+    }    
     else
     {
-        spin_unlock(&ourmbClosLock);
+    
+    printk( KERN_ERR "In ourmb_clos: Failed to close mailbox" );
+    printk( KERN_ERR "dumpData called within ourmb_clos, else (failure) branch" );
+    dumpData();
+    ret = -1;
+    } 
+    spin_unlock(&ourmbClosLock);
+    return ret;
+}
+
+static int ourmb_send(const char * mailboxID, pid_t procID, char * sendBuff, int lineLen, int * bytesCopied)
+{   
+    //spin_lock(&ourmbSendLock);
+    printk( KERN_INFO "Call to ourmb_send:\n mailboxID: %s\nprocID: %i\nsendBuff: %p\nlineLen: %i\nbytedCopied: %p\n",mailboxID,procID,sendBuff,lineLen,bytesCopied);
+    
+    int retValSend = 0;
+    int localMailboxIterator = findMailboxID(mailboxID);
+    if (localMailboxIterator < 0)
+    {
+        printk( KERN_ERR "In ourmb_send: MailboxId not found" );
         return -1;
     }
+    //retValSend = kfifo_from_user(&fifoQueues[localMailboxIterator],sendBuff,lineLen, bytesCopied);
+    // Copy from user syntax:
+    // copy_from_user ( to (ptr), from (ptr), n (bytes => int) )
+    copy_from_user(mailingList[localMailboxIterator].kFifoBuff,sendBuff,lineLen);
+	return retValSend; //0 -> Success, other -> failure
 }
 
-static int ourmb_send(const char * mailboxID, pid_t procID, char * sendBuff, int sizeOfSendBuff)
-{   
-    spin_lock(&ourmbSendLock);
-    
-    //Add code
-    
-    spin_unlock(&ourmbSendLock);
-	return 0; //Success
-}
-
-static int ourmb_recv(const char * mailboxID, pid_t procID, char * recvBuff)
+static int ourmb_recv(const char * mailboxID, pid_t procID, char * recvBuff, int * bytesCopied)
 {
-    spin_lock(&ourmbRecvLock);
+    //spin_lock(&ourmbRecvLock);
+    printk( KERN_INFO "Call to ourmb_recv:\n mailboxID: %s\nprocID: %i\nrecvBuff: %p\nbytesCopied: %p\n",mailboxID,procID,recvBuff,bytesCopied);
     
-    //Add code
-    
-    spin_unlock(&ourmbRecvLock);    
-	return 0; //Success
+    int retValRecv = 0;
+    int localMailboxIterator = findMailboxID(mailboxID);
+    if (localMailboxIterator < 0)
+    {
+        printk( KERN_ERR "In ourmb_recv: mailboxId not found" );
+        return -1;
+    }
+    //retValRecv = kfifo_to_user(&fifoQueues[localMailboxIterator],recvBuff,__KERN_PAGE_SIZE, bytesCopied);
+    // Copy to user syntax:
+    // copy_from_user ( to (ptr), from (ptr), n (bytes => int) )
+    copy_to_user ( recvBuff, mailingList[localMailboxIterator].kFifoBuff, 32);    
+    //spin_unlock(&ourmbRecvLock);    
+	return retValRecv; //Success
 }
 
 /******************   System call table manipulations   ******************/
@@ -531,17 +635,17 @@ static void hijack_syscall(ulong offset, ulong func_address, ulong * original_sy
 		//print table address, only pre-first-hijack
                 if (offset == __NR_nfsservctl) 
                 {
-                    printk(KERN_INFO "Syscall table address : %p\n", syscall_table);
+                    //printk(KERN_INFO "Syscall table address : %p\n", syscall_table);
                 }
 		//modify sys_call_table permission to rw                
                 page_read_write((ulong)syscall_table);
 		//save original entry
                 original_syscall = (void *)(syscall_table[offset]);
-                printk(KERN_INFO "Original syscall at offset %lu : address : %p\n", offset, original_syscall);
+                //printk(KERN_INFO "Original syscall at offset %lu : address : %p\n", offset, original_syscall);
         //replace entry with our custom system call function address
                 syscall_table[offset] = func_address;
-                printk(KERN_INFO "Syscall #%lu hijacked\n", offset);
-                printk(KERN_INFO "New syscall at offset %lu : address : %p\n", offset, (void *)syscall_table[offset]);
+                //printk(KERN_INFO "Syscall #%lu hijacked\n", offset);
+               // printk(KERN_INFO "New syscall at offset %lu : address : %p\n", offset, (void *)syscall_table[offset]);
 		//permission from rw -> ro 
                 page_read_only((ulong)syscall_table);
         } 
@@ -549,20 +653,31 @@ static void hijack_syscall(ulong offset, ulong func_address, ulong * original_sy
 
 /******************   LKM Module initialization and cleanup   ******************/
 static int init_syscalls(void)
-{	//Hijack 4 unimplemented system calls
-        printk(KERN_INFO "Module loading: Syscalls being hijacked...\n");
+{	
+        spin_lock_init(&ourmbOpenLock);
+        spin_lock_init(&ourmbClosLock);
+        spin_lock_init(&ourmbSendLock);
+        spin_lock_init(&ourmbRecvLock);
+        
+        //Hijack 4 unimplemented system calls
+        //printk(KERN_INFO "Module loading: Syscalls being hijacked...\n");
         hijack_syscall(__NR_ourmb_open, (ulong)ourmb_open, original_syscall180);
         hijack_syscall(__NR_ourmb_clos, (ulong)ourmb_clos, original_syscall181);
         hijack_syscall(__NR_ourmb_send, (ulong)ourmb_send, original_syscall182);
         hijack_syscall(__NR_ourmb_recv, (ulong)ourmb_recv, original_syscall183);
-        printk(KERN_INFO "Module loaded: Syscalls successfully hijacked\n");  
+        //printk(KERN_INFO "Module loaded: Syscalls successfully hijacked\n");  
+        
+    
         initializeAllFields();
+        printk(KERN_INFO "dumpData called within init_syscalls");
+        dumpData();
        return 0; //Success
 }
 
 static void cleanup_syscalls(void)
 {	     
-        printk(KERN_INFO "Module unloading: Syscalls being restored...\n");
+
+        //printk(KERN_INFO "Module unloading: Syscalls being restored...\n");
     //permission from ro -> rw
         page_read_write((ulong)syscall_table);
 	//restore original entries
@@ -572,7 +687,9 @@ static void cleanup_syscalls(void)
         syscall_table[__NR_ourmb_recv] = (ulong)original_syscall183;
 	//permission from rw -> ro 
         page_read_only((ulong)syscall_table);
-        printk(KERN_INFO "Module unloaded: Syscalls restored successfully\n");
+        //printk(KERN_INFO "Module unloaded: Syscalls restored successfully\n");
+        //kfree(kernBuff);
+        
 }
 
 module_init(init_syscalls);
